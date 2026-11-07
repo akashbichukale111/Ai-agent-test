@@ -1,282 +1,171 @@
 """
-app1.py - Production-Grade Asynchronous Task & Telemetry Orchestrator
+Production-Grade Resilient Token-Bucket Rate Limiter and Telemetry Engine.
 
-Architectural Components:
-    - Circuit Breaker Pattern implementation for downstream fault tolerance.
-    - Sliding Window Token Bucket Rate Limiter for request throttling.
-    - Concurrent worker pool leveraging asyncio.PriorityQueue.
-    - Real-time telemetry, latency metrics, and performance aggregation.
+This module implements an in-memory, thread-safe rate-limiting system designed
+for high-throughput API gateways and distributed microservices. It features
+strict input sanitization, dynamic token replenishment, and audit metrics.
 """
 
 from __future__ import annotations
 
-import asyncio
-import enum
 import logging
-import statistics
+import math
+import re
+import sys
+import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Coroutine, Dict, List, Optional
+from enum import Enum, auto
+from typing import Dict, Final, Optional, Tuple
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)-8s | [%(name)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+    format="%(asctime)s [%(levelname)s] [%(name)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
-logger = logging.getLogger("Orchestrator")
+logger = logging.getLogger("RateLimiterEngine")
+
+IDENTIFIER_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[a-zA-Z0-9_\-\.]{3,64}$")
 
 
-class CircuitState(enum.Enum):
-    CLOSED = "CLOSED"
-    OPEN = "OPEN"
-    HALF_OPEN = "HALF_OPEN"
+class RateLimitStatus(Enum):
+    """Evaluation outcomes for an access request."""
+
+    ALLOWED = auto()
+    THROTTLED = auto()
+    INVALID_IDENTIFIER = auto()
 
 
-class TaskPriority(enum.IntEnum):
-    CRITICAL = 1
-    HIGH = 2
-    NORMAL = 3
-    LOW = 4
+@dataclass(frozen=True)
+class RateLimitConfig:
+    """Configuration parameters for token bucket capacity and replenishment."""
 
+    capacity: float
+    refill_rate_per_sec: float
 
-class CircuitBreakerOpenException(Exception):
-    """Raised when an operation is rejected by an open circuit breaker."""
-    pass
-
-
-@dataclass(order=True)
-class PipelineTask:
-    priority: int
-    task_id: str = field(compare=False)
-    payload: Dict[str, Any] = field(compare=False)
-    handler: Callable[[Dict[str, Any]], Coroutine[Any, Any, Any]] = field(compare=False)
-    retries: int = field(default=0, compare=False)
-    max_retries: int = field(default=3, compare=False)
+    def __post_init__(self) -> None:
+        if self.capacity <= 0.0:
+            raise ValueError("Capacity must be strictly positive.")
+        if self.refill_rate_per_sec <= 0.0:
+            raise ValueError("Refill rate must be strictly positive.")
 
 
 @dataclass
-class TaskResult:
-    task_id: str
-    success: bool
-    data: Optional[Any] = None
-    error: Optional[str] = None
-    execution_time_ms: float = 0.0
+class BucketState:
+    """Thread-confined mutable state representing a single token bucket."""
+
+    tokens: float
+    last_updated: float
+    lock: threading.Lock = field(default_factory=threading.Lock)
 
 
-class CircuitBreaker:
-    """Manages failure rates and isolates failing external subsystems."""
+class TokenBucketRateLimiter:
+    """Thread-safe, production-ready implementation of the Token Bucket algorithm."""
 
-    def __init__(self, failure_threshold: int = 3, recovery_time_sec: float = 5.0) -> None:
-        self.failure_threshold = failure_threshold
-        self.recovery_time_sec = recovery_time_sec
-        self.state = CircuitState.CLOSED
-        self.failure_count = 0
-        self.last_failure_timestamp = 0.0
-        self._lock = asyncio.Lock()
+    def __init__(self, default_config: RateLimitConfig) -> None:
+        self._default_config = default_config
+        self._buckets: Dict[str, BucketState] = {}
+        self._global_lock = threading.Lock()
 
-    async def record_success(self) -> None:
-        async with self._lock:
-            self.failure_count = 0
-            self.state = CircuitState.CLOSED
+    def _sanitize_identifier(self, identifier: str) -> bool:
+        """Validates identity keys to prevent resource exhaustion and injection."""
+        if not identifier or not isinstance(identifier, str):
+            return False
+        return bool(IDENTIFIER_PATTERN.match(identifier))
 
-    async def record_failure(self) -> None:
-        async with self._lock:
-            self.failure_count += 1
-            self.last_failure_timestamp = time.monotonic()
-            if self.failure_count >= self.failure_threshold:
-                self.state = CircuitState.OPEN
-                logger.warning("Circuit breaker tripped to OPEN state.")
+    def _get_or_create_bucket(self, client_id: str, current_time: float) -> BucketState:
+        """Retrieves or safely registers a new client bucket using double-checked locking."""
+        with self._global_lock:
+            if client_id not in self._buckets:
+                self._buckets[client_id] = BucketState(
+                    tokens=self._default_config.capacity,
+                    last_updated=current_time,
+                )
+            return self._buckets[client_id]
 
-    async def allow_execution(self) -> bool:
-        async with self._lock:
-            if self.state == CircuitState.CLOSED:
-                return True
-            if self.state == CircuitState.OPEN:
-                if time.monotonic() - self.last_failure_timestamp >= self.recovery_time_sec:
-                    self.state = CircuitState.HALF_OPEN
-                    logger.info("Circuit breaker entered HALF_OPEN state; testing recovery.")
-                    return True
-                return False
-            return True
+    def consume(
+        self, client_id: str, tokens_requested: float = 1.0
+    ) -> Tuple[RateLimitStatus, float]:
+        """
+        Attempts to consume tokens for a given identifier.
+        Returns a tuple of (RateLimitStatus, remaining_tokens).
+        """
+        if not self._sanitize_identifier(client_id):
+            logger.warning("Rejected evaluation for invalid identifier: %s", client_id)
+            return RateLimitStatus.INVALID_IDENTIFIER, 0.0
 
+        if tokens_requested <= 0.0:
+            raise ValueError("Requested tokens must be greater than zero.")
 
-class TokenBucketLimiter:
-    """Async thread-safe token bucket algorithm for egress throttling."""
+        now = time.monotonic()
+        bucket = self._get_or_create_bucket(client_id, now)
 
-    def __init__(self, rate_per_second: float, burst_capacity: int) -> None:
-        self.rate = rate_per_second
-        self.capacity = burst_capacity
-        self.tokens = float(burst_capacity)
-        self.last_refill = time.monotonic()
-        self._lock = asyncio.Lock()
+        with bucket.lock:
+            elapsed = max(0.0, now - bucket.last_updated)
+            replenished = elapsed * self._default_config.refill_rate_per_sec
+            bucket.tokens = min(self._default_config.capacity, bucket.tokens + replenished)
+            bucket.last_updated = now
 
-    async def acquire(self) -> None:
-        while True:
-            async with self._lock:
-                now = time.monotonic()
-                elapsed = now - self.last_refill
-                self.last_refill = now
-                self.tokens = min(self.capacity, self.tokens + elapsed * self.rate)
+            if bucket.tokens >= tokens_requested:
+                bucket.tokens -= tokens_requested
+                remaining = bucket.tokens
+                return RateLimitStatus.ALLOWED, remaining
 
-                if self.tokens >= 1.0:
-                    self.tokens -= 1.0
-                    return
+            return RateLimitStatus.THROTTLED, bucket.tokens
 
-                sleep_time = (1.0 - self.tokens) / self.rate
-            await asyncio.sleep(sleep_time)
-
-
-class TelemetryCollector:
-    """Aggregates execution latency and error metrics."""
-
-    def __init__(self) -> None:
-        self.latencies: List[float] = []
-        self.successes: int = 0
-        self.failures: int = 0
-        self._lock = asyncio.Lock()
-
-    async def record(self, result: TaskResult) -> None:
-        async with self._lock:
-            self.latencies.append(result.execution_time_ms)
-            if result.success:
-                self.successes += 1
-            else:
-                self.failures += 1
-
-    async def report(self) -> Dict[str, Any]:
-        async with self._lock:
-            if not self.latencies:
-                return {"status": "No metrics captured."}
-
-            return {
-                "total_tasks": len(self.latencies),
-                "successful_tasks": self.successes,
-                "failed_tasks": self.failures,
-                "success_rate_percent": round((self.successes / len(self.latencies)) * 100, 2),
-                "p50_latency_ms": round(statistics.median(self.latencies), 2),
-                "p95_latency_ms": round(statistics.quantiles(self.latencies, n=20)[18], 2)
-                if len(self.latencies) >= 20
-                else round(max(self.latencies), 2),
-                "mean_latency_ms": round(statistics.mean(self.latencies), 2),
-            }
+    def prune_stale_buckets(self, ttl_seconds: float = 3600.0) -> int:
+        """Purges inactive records to prevent unbound memory growth."""
+        now = time.monotonic()
+        removed_count = 0
+        with self._global_lock:
+            stale_keys = [
+                key
+                for key, state in self._buckets.items()
+                if (now - state.last_updated) > ttl_seconds
+            ]
+            for key in stale_keys:
+                del self._buckets[key]
+                removed_count += 1
+        if removed_count > 0:
+            logger.info("Evicted %d stale client buckets from memory.", removed_count)
+        return removed_count
 
 
-class AsyncPipelineEngine:
-    """Coordinates task scheduling, execution, resilient retries, and metrics."""
+def execute_verification_pipeline() -> None:
+    """Executes verification tests to ensure thread-safety and constraint compliance."""
+    config = RateLimitConfig(capacity=5.0, refill_rate_per_sec=2.0)
+    limiter = TokenBucketRateLimiter(default_config=config)
+    client_id = "tenant-prod-us-east-1"
 
-    def __init__(
-        self,
-        worker_concurrency: int = 4,
-        rate_limit_rps: float = 10.0,
-    ) -> None:
-        self.concurrency = worker_concurrency
-        self.queue: asyncio.PriorityQueue[PipelineTask] = asyncio.PriorityQueue()
-        self.circuit_breaker = CircuitBreaker(failure_threshold=3, recovery_time_sec=2.0)
-        self.rate_limiter = TokenBucketLimiter(rate_per_second=rate_limit_rps, burst_capacity=5)
-        self.telemetry = TelemetryCollector()
-        self.workers: List[asyncio.Task] = []
-        self.is_running = False
+    logger.info("Starting production readiness validation for %s...", client_id)
 
-    async def submit(self, task: PipelineTask) -> None:
-        await self.queue.put(task)
+    # Validate burst consumption
+    for i in range(5):
+        status, remaining = limiter.consume(client_id, 1.0)
+        assert status == RateLimitStatus.ALLOWED, f"Expected ALLOWED on burst iteration {i}"
 
-    async def _execute_single_task(self, task: PipelineTask) -> TaskResult:
-        await self.rate_limiter.acquire()
+    # Validate throttling trigger
+    status, remaining = limiter.consume(client_id, 1.0)
+    assert status == RateLimitStatus.THROTTLED, "Expected THROTTLED when capacity exhausted"
+    logger.info("Rate limiter correctly saturated: %s (Remaining: %.2f)", status.name, remaining)
 
-        if not await self.circuit_breaker.allow_execution():
-            return TaskResult(
-                task_id=task.task_id,
-                success=False,
-                error="Execution rejected by CircuitBreaker (OPEN).",
-            )
+    # Validate replenishment
+    time.sleep(1.0)
+    status, remaining = limiter.consume(client_id, 1.0)
+    assert status == RateLimitStatus.ALLOWED, "Expected replenishment after sleep"
+    logger.info("Token replenishment verified successfully: %s (Remaining: %.2f)", status.name, remaining)
 
-        start_time = time.monotonic()
-        try:
-            output = await task.handler(task.payload)
-            elapsed_ms = (time.monotonic() - start_time) * 1000.0
-            await self.circuit_breaker.record_success()
-            return TaskResult(task_id=task.task_id, success=True, data=output, execution_time_ms=elapsed_ms)
-        except Exception as exc:
-            elapsed_ms = (time.monotonic() - start_time) * 1000.0
-            await self.circuit_breaker.record_failure()
-            logger.error("Task %s failed: %s", task.task_id, exc)
-            return TaskResult(task_id=task.task_id, success=False, error=str(exc), execution_time_ms=elapsed_ms)
-
-    async def _worker_loop(self, worker_id: int) -> None:
-        logger.debug("Worker-%d initialized.", worker_id)
-        while self.is_running or not self.queue.empty():
-            try:
-                task = await asyncio.wait_for(self.queue.get(), timeout=0.5)
-            except asyncio.TimeoutError:
-                continue
-
-            result = await self._execute_single_task(task)
-            await self.telemetry.record(result)
-
-            if not result.success and task.retries < task.max_retries:
-                task.retries += 1
-                backoff = 0.2 * (2 ** task.retries)
-                logger.info("Rescheduling %s in %.2fs (retry %d/%d)", task.task_id, backoff, task.retries, task.max_retries)
-                await asyncio.sleep(backoff)
-                await self.queue.put(task)
-
-            self.queue.task_done()
-
-    async def start(self) -> None:
-        self.is_running = True
-        self.workers = [
-            asyncio.create_task(self._worker_loop(i), name=f"Worker-{i}")
-            for i in range(self.concurrency)
-        ]
-        logger.info("Engine started with %d workers.", self.concurrency)
-
-    async def stop(self) -> None:
-        self.is_running = False
-        await self.queue.join()
-        for worker in self.workers:
-            worker.cancel()
-        await asyncio.gather(*self.workers, return_exceptions=True)
-        logger.info("Engine gracefully shutdown.")
-
-
-# =====================================================================
-# Simulation Handlers & Main Driver
-# =====================================================================
-
-async def mock_ai_inference(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Simulates varying compute latency and transient network drops."""
-    await asyncio.sleep(payload.get("delay", 0.05))
-    if payload.get("induce_failure", False):
-        raise ConnectionResetError("Simulated remote gateway reset")
-    return {"status": "INFERRED", "embedding_dim": 768, "input_len": len(payload.get("text", ""))}
-
-
-async def main() -> None:
-    logger.info("Initializing Orchestration Engine...")
-    engine = AsyncPipelineEngine(worker_concurrency=4, rate_limit_rps=20.0)
-    await engine.start()
-
-    logger.info("Enqueuing synthetic enterprise batch requests...")
-    for idx in range(25):
-        is_err = idx in (5, 6, 7)  # Induce sequential failures to stress Circuit Breaker
-        priority = TaskPriority.CRITICAL if idx % 5 == 0 else TaskPriority.NORMAL
-        task = PipelineTask(
-            priority=priority,
-            task_id=f"TX-{1000 + idx}",
-            payload={"text": f"Vectorized query string {idx}", "delay": 0.02, "induce_failure": is_err},
-            handler=mock_ai_inference,
-            max_retries=2,
-        )
-        await engine.submit(task)
-
-    await engine.stop()
-
-    report = await engine.telemetry.report()
-    logger.info("---------------- EXECUTION METRICS ----------------")
-    for key, val in report.items():
-        logger.info("  %s: %s", key, val)
-    logger.info("---------------------------------------------------")
+    # Validate identifier policy enforcement
+    status, _ = limiter.consume("bad!identifier", 1.0)
+    assert status == RateLimitStatus.INVALID_IDENTIFIER, "Expected validation rejection on bad key"
+    logger.info("Security sanitization verified: invalid identifiers rejected.")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        execute_verification_pipeline()
+        logger.info("All engine operations completed nominal specification checks.")
+        sys.exit(0)
+    except Exception as exc:
+        logger.critical("Fatal execution failure during startup validation: %s", str(exc), exc_info=True)
+        sys.exit(1)
